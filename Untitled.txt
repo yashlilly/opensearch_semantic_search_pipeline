@@ -1,0 +1,117 @@
+"""
+Downloads PDFs from Google Drive links in a CSV column named 'CV'
+and zips them into one folder.
+
+Usage:
+    python download_cv_pdfs.py input.csv output.zip
+
+Requires: pandas, requests
+Install from your company's Artifactory index, e.g.:
+    pip install pandas requests --index-url <your-artifactory-pypi-url>
+"""
+
+import sys
+import os
+import re
+import zipfile
+import shutil
+import pandas as pd
+import requests
+
+
+def extract_file_id(url):
+    """Pull the Google Drive file ID out of common link formats."""
+    patterns = [
+        r"/d/([a-zA-Z0-9_-]+)",
+        r"id=([a-zA-Z0-9_-]+)",
+    ]
+    for p in patterns:
+        match = re.search(p, str(url))
+        if match:
+            return match.group(1)
+    return None
+
+
+def download_pdf(file_id, dest_path):
+    """Download a file from Google Drive by file ID."""
+    session = requests.Session()
+    url = "https://drive.google.com/uc?export=download"
+    response = session.get(url, params={"id": file_id}, stream=True)
+
+    # Handle Google Drive's "large file" confirmation token
+    token = None
+    for key, value in response.cookies.items():
+        if key.startswith("download_warning"):
+            token = value
+
+    if token:
+        response = session.get(
+            url, params={"id": file_id, "confirm": token}, stream=True
+        )
+
+    if response.status_code != 200:
+        return False
+
+    with open(dest_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=32768):
+            if chunk:
+                f.write(chunk)
+    return True
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("Usage: python download_cv_pdfs.py input.csv output.zip")
+        sys.exit(1)
+
+    csv_path = sys.argv[1]
+    zip_path = sys.argv[2]
+
+    df = pd.read_csv(csv_path)
+
+    if "CV" not in df.columns:
+        print("Error: no column named 'CV' found in the CSV.")
+        sys.exit(1)
+
+    temp_dir = "cv_downloads_temp"
+    os.makedirs(temp_dir, exist_ok=True)
+
+    success_count = 0
+    fail_list = []
+
+    for i, link in enumerate(df["CV"], start=1):
+        if pd.isna(link) or not str(link).strip():
+            continue
+
+        file_id = extract_file_id(link)
+        if not file_id:
+            fail_list.append((i, link, "could not read file ID"))
+            continue
+
+        dest_path = os.path.join(temp_dir, f"CV_{i}.pdf")
+        try:
+            ok = download_pdf(file_id, dest_path)
+            if ok:
+                success_count += 1
+                print(f"Downloaded row {i}")
+            else:
+                fail_list.append((i, link, "download failed"))
+        except Exception as e:
+            fail_list.append((i, link, str(e)))
+
+    # Zip all downloaded files
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        for file_name in os.listdir(temp_dir):
+            zipf.write(os.path.join(temp_dir, file_name), file_name)
+
+    shutil.rmtree(temp_dir)
+
+    print(f"\nDone. {success_count} PDFs downloaded and zipped into {zip_path}")
+    if fail_list:
+        print(f"{len(fail_list)} failed:")
+        for row, link, reason in fail_list:
+            print(f"  Row {row}: {reason} ({link})")
+
+
+if __name__ == "__main__":
+    main()
